@@ -3084,20 +3084,39 @@ impl Store {
                 let verify_after_sign = settings.verify.verify_after_sign;
                 // Also catch the case where we may have written to io::empty() or similar
                 if verify_after_sign && output_stream.seek(SeekFrom::End(0))? > 0 {
-                    // verify the store
+                    // Verify only the active manifest's signature and data hashes.
+                    // Ingredient validation is skipped — ingredients were validated at
+                    // ingestion and may have attested errors that are expected.
+                    let claim = self.provenance_claim().ok_or(Error::ProvenanceMissing)?;
                     let mut validation_log =
                         StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
+                    let mut asset_data =
+                        crate::claim::ClaimAssetData::Stream(output_stream, format);
+                    let svi = self.get_store_validation_info(
+                        claim,
+                        &mut asset_data,
+                        &mut validation_log,
+                    )?;
+
+                    context.check_progress(ProgressPhase::VerifyingManifest, 1, 1)?;
+
                     if _sync {
-                        Store::verify_store(
-                            self,
-                            &mut crate::claim::ClaimAssetData::Stream(output_stream, format),
+                        Claim::verify_claim(
+                            claim,
+                            &mut asset_data,
+                            &svi,
+                            true,
+                            &self.ctp,
                             &mut validation_log,
                             context,
                         )?;
                     } else {
-                        Store::verify_store_async(
-                            self,
-                            &mut crate::claim::ClaimAssetData::Stream(output_stream, format),
+                        Claim::verify_claim_async(
+                            claim,
+                            &mut asset_data,
+                            &svi,
+                            true,
+                            &self.ctp,
                             &mut validation_log,
                             context,
                         )
