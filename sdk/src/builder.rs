@@ -55,7 +55,7 @@ use crate::{
         path_utils::sanitize_archive_path, xmp_inmemory_utils::XmpInfo,
     },
     AsyncSigner, ClaimGeneratorInfo, EphemeralSigner, HashRange, HashedUri, Ingredient,
-    ManifestAssertionKind, Reader, Relationship, Signer,
+    ManifestAssertionKind, Reader, Relationship, Signer, SigningAlg,
 };
 
 /// Label for the `archive:type` field in working-store archive metadata.
@@ -430,6 +430,28 @@ pub struct Builder {
     /// - `contentauth:urn:uuid:c2677d4b-0a93-4444-876f-ed2f2d40b8cf`
     /// - `urn:c2pa:fa479510-2a7d-c165-7b26-488a267f4c6a`
     pub timestamp_manifest_labels: HashSet<String>,
+
+    /// If true, sign deterministically: salts are omitted on assertions and
+    /// the per-sign random `instance_id` overwrites in `Builder` are
+    /// suppressed.
+    ///
+    /// To actually produce byte-identical output across runs the caller must
+    /// also:
+    /// - use a deterministic signer (e.g. Ed25519 / RFC 8032); RSA-PSS and
+    ///   non-RFC-6979 ECDSA will diverge per run even with this flag,
+    /// - leave the time-stamp authority unset (TSA timestamps are
+    ///   non-deterministic),
+    /// - set `definition.label` and `definition.instance_id` to stable,
+    ///   typically content-derived values — otherwise `Claim::new` mints a
+    ///   random UUID label before this flag takes effect, silently breaking
+    ///   determinism (`Builder::to_claim` errors out when this happens).
+    ///
+    /// `Builder::sign` logs a `warn` when this flag is set together with a
+    /// non-deterministic signer or a configured TSA. Determinism is NOT
+    /// enforced by the SDK beyond that: callers should verify byte-equality
+    /// in their own tests.
+    #[serde(default)]
+    pub deterministic: bool,
 
     /// Container for binary assets (like thumbnails).
     #[serde(skip)]
@@ -1264,6 +1286,38 @@ impl Builder {
         Builder::new().with_archive(stream)
     }
 
+    // Overwrite `definition.instance_id` with a fresh random `xmp:iid:` URN
+    // unless deterministic signing is enabled, in which case any caller-set
+    // (typically content-derived) instance_id is preserved as-is.
+    fn maybe_refresh_instance_id(&mut self) {
+        if !self.deterministic {
+            self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
+        }
+    }
+
+    // When deterministic signing is requested, warn (don't fail) if the
+    // chosen signer can't deliver byte-identical output. Only Ed25519
+    // (RFC 8032) is guaranteed deterministic; a configured TSA embeds wall
+    // time. Catching this at sign-time turns a silent "why doesn't my CDN
+    // cache stay consistent" debugging session into a visible warning.
+    fn warn_if_signer_undermines_determinism(&self, alg: SigningAlg, tsa_url: Option<&str>) {
+        if !self.deterministic {
+            return;
+        }
+        if alg != SigningAlg::Ed25519 {
+            log::warn!(
+                "Builder.deterministic=true with non-deterministic signer alg {alg:?}; \
+                 output will not be byte-identical across runs (use Ed25519 for guaranteed determinism)"
+            );
+        }
+        if tsa_url.is_some() {
+            log::warn!(
+                "Builder.deterministic=true with a time-stamp authority configured; \
+                 TSA timestamps make output non-deterministic"
+            );
+        }
+    }
+
     // Convert a Manifest into a Claim
     fn to_claim(&self) -> Result<Claim> {
         // utility function to add created or gathered assertions
@@ -1317,6 +1371,17 @@ impl Builder {
             "".to_string() // claim_generator is not used in version 2
         };
 
+        // In deterministic mode `Claim::new` would mint a random UUID label
+        // before `set_deterministic` runs, silently breaking byte-identical
+        // output. Force callers to supply a stable label upfront.
+        if self.deterministic && definition.label.is_none() {
+            return Err(Error::BadParam(
+                "Builder.deterministic=true requires definition.label to be set \
+                 (typically a content-derived value)"
+                    .to_string(),
+            ));
+        }
+
         let mut claim = match definition.label.as_ref() {
             Some(label) => Claim::new_with_user_guid(
                 &claim_generator,
@@ -1330,6 +1395,11 @@ impl Builder {
             ),
         }
         .with_context(self.context.clone());
+
+        // Propagate deterministic signing so assertions added here and later
+        // in the store embed path are hashed with NoSalt for byte-identical
+        // output.
+        claim.set_deterministic(self.deterministic);
 
         // add claim generator info to claim and resolve icons
         for info in &claim_generator_info {
@@ -1991,7 +2061,7 @@ impl Builder {
             self.add_assertion(labels::DATA_HASH, &ph)?;
         }
         self.definition.format = format.to_string();
-        self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
+        self.maybe_refresh_instance_id();
         let mut store = self.to_store()?;
         let placeholder = store.get_data_hashed_manifest_placeholder(reserve_size, format)?;
         Ok(placeholder)
@@ -2746,7 +2816,7 @@ impl Builder {
         signer: &dyn Signer,
         format: &str,
     ) -> Result<Vec<u8>> {
-        self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
+        self.maybe_refresh_instance_id();
 
         let mut store = self.to_store()?;
         let bytes = if _sync {
@@ -2796,6 +2866,10 @@ impl Builder {
         R: Read + Seek + Send,
         W: Write + Read + Seek + Send,
     {
+        self.warn_if_signer_undermines_determinism(
+            signer.alg(),
+            signer.time_authority_url().as_deref(),
+        );
         let format = format_to_mime(format);
         self.definition.format.clone_from(&format);
         if let Some(instance_id) = XmpInfo::from_source(source, &format).instance_id {
@@ -2945,7 +3019,7 @@ impl Builder {
 
         self.definition.format =
             crate::format_from_path(path).ok_or(crate::Error::UnsupportedType)?;
-        self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
+        self.maybe_refresh_instance_id();
         if self.definition.title.is_none() {
             if let Some(title) = path.file_name() {
                 self.definition.title = Some(title.to_string_lossy().to_string());
@@ -9652,5 +9726,180 @@ mod tests {
 
         let future = builder.sign_async(&signer, "image/jpeg", &mut src, &mut dst);
         assert_send(future);
+    }
+
+    // A manifest with fixed `label` and `instance_id` so the only sources of
+    // run-to-run divergence are the salt and instance_id paths that
+    // `Builder.deterministic` is supposed to suppress.
+    fn fixed_id_manifest_json(format: &str) -> String {
+        json!({
+            "label": "urn:c2pa:00000000-0000-4000-8000-000000000001",
+            "instance_id": "xmp:iid:00000000-0000-4000-8000-000000000002",
+            "claim_generator_info": [
+                {"name": "c2pa_test", "version": "1.0.0"}
+            ],
+            "title": "Deterministic_Test",
+            "format": format,
+            "assertions": [
+                {
+                    "label": "c2pa.actions",
+                    "data": {
+                        "actions": [
+                            {
+                                "action": "c2pa.created",
+                                "digitalSourceType": "http://c2pa.org/digitalsourcetype/empty",
+                            }
+                        ]
+                    }
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    fn sign_once(deterministic: bool, src: &[u8], mime: &str) -> Vec<u8> {
+        #[cfg(target_os = "wasi")]
+        Settings::reset().unwrap();
+
+        let mut builder = Builder::from_json(&fixed_id_manifest_json(mime)).unwrap();
+        builder.deterministic = deterministic;
+
+        let signer = test_signer(SigningAlg::Ed25519);
+        let mut source = Cursor::new(src);
+        let mut dest = Cursor::new(Vec::new());
+        builder
+            .sign(signer.as_ref(), mime, &mut source, &mut dest)
+            .unwrap();
+        dest.into_inner()
+    }
+
+    // Read the signed output through Reader and require a valid active
+    // manifest — rules out the failure mode where signing silently produces
+    // identical-but-broken output (the byte-equality check below would
+    // otherwise pass for two identical errors).
+    fn assert_readable_manifest(bytes: &[u8], mime: &str) {
+        let reader = Reader::from_stream(mime, &mut Cursor::new(bytes)).unwrap();
+        assert!(
+            reader.active_manifest().is_some(),
+            "deterministic output must contain a readable active manifest"
+        );
+        assert!(
+            matches!(
+                reader.validation_state(),
+                ValidationState::Valid | ValidationState::Trusted
+            ),
+            "deterministic output must read back as a valid manifest, got {:?}",
+            reader.validation_state()
+        );
+    }
+
+    #[test]
+    fn test_sign_deterministic_is_byte_identical_jpeg() {
+        let first = sign_once(true, TEST_IMAGE_CLEAN, "image/jpeg");
+        let second = sign_once(true, TEST_IMAGE_CLEAN, "image/jpeg");
+        assert_readable_manifest(&first, "image/jpeg");
+        assert_readable_manifest(&second, "image/jpeg");
+        assert_eq!(
+            first, second,
+            "deterministic JPEG sign must produce byte-identical output"
+        );
+    }
+
+    // BMFF/MP4 has a different store-embed path (BMFF hash assertion). Catches
+    // a regression where a guarded instance_id refresh was missed on the BMFF
+    // branch but not on JPEG.
+    #[test]
+    fn test_sign_deterministic_is_byte_identical_mp4() {
+        let first = sign_once(true, TEST_VIDEO_MP4, "video/mp4");
+        let second = sign_once(true, TEST_VIDEO_MP4, "video/mp4");
+        assert_readable_manifest(&first, "video/mp4");
+        assert_readable_manifest(&second, "video/mp4");
+        assert_eq!(
+            first, second,
+            "deterministic MP4 sign must produce byte-identical output"
+        );
+    }
+
+    #[test]
+    fn test_sign_non_deterministic_differs() {
+        // Negative control: without the flag, salts and the Uuid::new_v4()
+        // overwrites in Builder::sign make the two outputs diverge. If this
+        // ever starts passing as equal, the positive determinism test above
+        // has lost its meaning (it would be passing on a pipeline that's
+        // already accidentally deterministic).
+        let first = sign_once(false, TEST_IMAGE_CLEAN, "image/jpeg");
+        let second = sign_once(false, TEST_IMAGE_CLEAN, "image/jpeg");
+        assert!(!first.is_empty());
+        assert_ne!(
+            first, second,
+            "non-deterministic sign should diverge run-to-run"
+        );
+    }
+
+    // The async sign path is generated by `#[async_generic]` from the sync
+    // body. Exercise it once to make sure the macro expansion preserves the
+    // deterministic flag plumbing.
+    #[c2pa_test_async]
+    async fn test_sign_async_deterministic_is_byte_identical() {
+        #[cfg(target_os = "wasi")]
+        Settings::reset().unwrap();
+
+        let signer = async_test_signer(SigningAlg::Ed25519);
+        let mut outputs: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..2 {
+            let mut builder = Builder::from_json(&fixed_id_manifest_json("image/jpeg")).unwrap();
+            builder.deterministic = true;
+            let mut source = Cursor::new(TEST_IMAGE_CLEAN);
+            let mut dest = Cursor::new(Vec::new());
+            builder
+                .sign_async(signer.as_ref(), "image/jpeg", &mut source, &mut dest)
+                .await
+                .unwrap();
+            outputs.push(dest.into_inner());
+        }
+        assert_readable_manifest(&outputs[0], "image/jpeg");
+        assert_eq!(
+            outputs[0], outputs[1],
+            "async deterministic sign must produce byte-identical output"
+        );
+    }
+
+    // Belt-and-suspenders for the label footgun guard in `to_claim`: a caller
+    // who flips `deterministic = true` but forgets to set `definition.label`
+    // must get a hard error (otherwise `Claim::new` would mint a random UUID
+    // label before the deterministic flag takes effect, silently breaking
+    // byte-identical output).
+    #[test]
+    fn test_sign_deterministic_without_label_errors() {
+        #[cfg(target_os = "wasi")]
+        Settings::reset().unwrap();
+
+        let manifest = json!({
+            "instance_id": "xmp:iid:00000000-0000-4000-8000-000000000002",
+            "claim_generator_info": [{"name": "c2pa_test", "version": "1.0.0"}],
+            "title": "Deterministic_Test",
+            "format": "image/jpeg",
+            "assertions": [{
+                "label": "c2pa.actions",
+                "data": {"actions": [{
+                    "action": "c2pa.created",
+                    "digitalSourceType": "http://c2pa.org/digitalsourcetype/empty"
+                }]}
+            }]
+        })
+        .to_string();
+
+        let mut builder = Builder::from_json(&manifest).unwrap();
+        builder.deterministic = true;
+        let signer = test_signer(SigningAlg::Ed25519);
+        let mut source = Cursor::new(TEST_IMAGE_CLEAN);
+        let mut dest = Cursor::new(Vec::new());
+        let err = builder
+            .sign(signer.as_ref(), "image/jpeg", &mut source, &mut dest)
+            .expect_err("must error when deterministic && label is None");
+        assert!(
+            matches!(err, Error::BadParam(ref m) if m.contains("label")),
+            "unexpected error: {err:?}"
+        );
     }
 }

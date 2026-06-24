@@ -73,7 +73,7 @@ use crate::{
     jumbf_io::get_assetio_handler,
     log_item,
     resource_store::UriOrResource,
-    salt::{DefaultSalt, SaltGenerator},
+    salt::{DefaultSalt, NoSalt, SaltGenerator},
     settings::{Settings, MAX_ASSERTIONS},
     status_tracker::{ErrorBehavior, StatusTracker},
     store::StoreValidationInfo,
@@ -334,6 +334,10 @@ pub struct Claim {
 
     // Optional context for settings access (set when created from Builder)
     context: Option<Arc<Context>>,
+
+    // Runtime-only flag: when true, assertions are hashed with NoSalt so the
+    // produced manifest bytes are deterministic for a given input.
+    deterministic: bool,
 }
 
 /// Enum to define how assertions are are stored when output to json
@@ -459,6 +463,7 @@ impl Claim {
             created_assertions: Vec::new(),
             gathered_assertions: None,
             context: None,
+            deterministic: false,
         }
     }
 
@@ -559,6 +564,7 @@ impl Claim {
             created_assertions: Vec::new(),
             gathered_assertions: None,
             context: None,
+            deterministic: false,
         })
     }
 
@@ -693,6 +699,7 @@ impl Claim {
                 created_assertions: Vec::new(),
                 gathered_assertions: None,
                 context: None,
+                deterministic: false,
             })
         } else {
             /* Claim V2 fields
@@ -802,6 +809,7 @@ impl Claim {
                 created_assertions,
                 gathered_assertions,
                 context: None,
+                deterministic: false,
             })
         }
     }
@@ -1348,13 +1356,24 @@ impl Claim {
         Ok(hash_by_alg(alg, &hash_bytes, None))
     }
 
+    /// Enable or disable deterministic hashing for assertions added to this
+    /// claim. When enabled, `add_assertion`/`add_created_assertion` use
+    /// `NoSalt` instead of a random `DefaultSalt`.
+    pub fn set_deterministic(&mut self, deterministic: bool) {
+        self.deterministic = deterministic;
+    }
+
     /// Add an assertion to this claim and verify
     /// This uses a default salt generator and will assumed gathered for Claims V2 except for HASH assertions.
     pub fn add_assertion(
         &mut self,
         assertion_builder: &impl AssertionBase,
     ) -> Result<C2PAAssertion> {
-        self.add_assertion_impl(assertion_builder, &DefaultSalt::default(), false)
+        if self.deterministic {
+            self.add_assertion_impl(assertion_builder, &NoSalt, false)
+        } else {
+            self.add_assertion_impl(assertion_builder, &DefaultSalt::default(), false)
+        }
     }
 
     /// Same as add_assertion but forces addition to created_assertions for Claims V2
@@ -1362,7 +1381,11 @@ impl Claim {
         &mut self,
         assertion_builder: &impl AssertionBase,
     ) -> Result<C2PAAssertion> {
-        self.add_assertion_impl(assertion_builder, &DefaultSalt::default(), true)
+        if self.deterministic {
+            self.add_assertion_impl(assertion_builder, &NoSalt, true)
+        } else {
+            self.add_assertion_impl(assertion_builder, &DefaultSalt::default(), true)
+        }
     }
 
     fn compatibility_checks(&self, assertion: &Assertion) -> Result<()> {
