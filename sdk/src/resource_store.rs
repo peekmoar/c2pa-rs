@@ -159,6 +159,27 @@ impl ResourceRef {
     }
 }
 
+// Reject resource ids that would escape the resource store's `base_path` when
+// joined as a relative path: absolute paths, Windows drive prefixes, and any
+// `..` segments. `Path::components` collapses redundant separators and `.`
+// segments to canonical Component values, so this catches both `../foo` and
+// `nested/../../etc/passwd`.
+#[cfg(feature = "file_io")]
+fn reject_unsafe_resource_id(id: &str) -> crate::Result<()> {
+    use std::path::Component;
+    for component in Path::new(id).components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(crate::Error::BadParam(format!(
+                    "resource id is not a safe relative path: {id:?}"
+                )));
+            }
+            Component::Normal(_) | Component::CurDir => {}
+        }
+    }
+    Ok(())
+}
+
 /// Resource store to contain binary objects referenced from JSON serializable structures
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "json_schema", derive(JsonSchema))]
@@ -287,14 +308,21 @@ impl ResourceStore {
         S: Into<String>,
         R: Into<Vec<u8>>,
     {
+        let id = id.into();
         #[cfg(feature = "file_io")]
         if let Some(base) = self.base_path.as_ref() {
-            let path = base.join(id.into());
+            // `id` is used as a path component below — reject anything that
+            // could escape `base` (absolute paths, drive prefixes, or `..`
+            // segments). Manifest ids reaching this method (instance_id,
+            // thumbnail labels) are caller-controlled JSON; without this
+            // check a hostile id can write outside `base`.
+            reject_unsafe_resource_id(&id)?;
+            let path = base.join(&id);
             create_dir_all(path.parent().unwrap_or(Path::new("")))?;
             write(path, value.into())?;
             return Ok(self);
         }
-        self.resources.insert(id.into(), value.into());
+        self.resources.insert(id, value.into());
         Ok(self)
     }
 
